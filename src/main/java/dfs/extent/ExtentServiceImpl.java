@@ -5,6 +5,7 @@ import java.io.IOException;
 import java.nio.file.*;
 import java.util.stream.Collectors;
 import com.google.protobuf.ByteString;
+import dfs.extent.ExtentServiceGrpc;
 
 import dfs.extent.ExtentServiceOuterClass.GetRequest;
 import dfs.extent.ExtentServiceOuterClass.GetResponse;
@@ -13,7 +14,7 @@ import dfs.extent.ExtentServiceOuterClass.PutResponse;
 import dfs.extent.ExtentServiceOuterClass.StopRequest;
 import dfs.extent.ExtentServiceOuterClass.StopResponse;
 
-public class ExtenServiceImpl extends ExtentServiceGrpc.ExtentServiceImplBase {
+public class ExtentServiceImpl extends ExtentServiceGrpc.ExtentServiceImplBase {
     private final Path root;
     private final Runnable onStop;
 
@@ -47,11 +48,12 @@ public class ExtenServiceImpl extends ExtentServiceGrpc.ExtentServiceImplBase {
                 ensureDirName(name);
                 Path dir = mapDfsToFs(name);
                 if (Files.isDirectory(dir)) {
-                    String listing = Files.list(dir)
-                            .sorted()
-                            .map(p -> p.getFileName().toString() + (Files.isDirectory(p) ? "/" : ""))
-                            .collect(Collectors.joining("\n"));
-                    out.setFileData(ByteString.copyFrom(listing.getBytes()));
+                    try (var s = Files.list(dir)) {
+                        String listing = s.sorted()
+                                .map(p -> p.getFileName().toString() + (Files.isDirectory(p) ? "/" : ""))
+                                .collect(Collectors.joining("\n"));
+                        out.setFileData(ByteString.copyFrom(listing.getBytes()));
+                    }
                 }
             } else {
                 ensureFileName(name);
@@ -60,9 +62,7 @@ public class ExtenServiceImpl extends ExtentServiceGrpc.ExtentServiceImplBase {
                     out.setFileData(ByteString.copyFrom(Files.readAllBytes(file)));
                 }
             }
-        } catch (Exception ignored) {
-            // pri chybe nechaj fileData nevyplnené → "null"
-        }
+        } catch (Exception ignored) {}
 
         resp.onNext(out.build());
         resp.onCompleted();

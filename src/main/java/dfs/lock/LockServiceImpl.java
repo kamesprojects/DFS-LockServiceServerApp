@@ -4,6 +4,7 @@ import io.grpc.stub.StreamObserver;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import dfs.lock.LockServiceGrpc;
 
 import dfs.lock.LockServiceOuterClass.AcquireRequest;
 import dfs.lock.LockServiceOuterClass.AcquireResponse;
