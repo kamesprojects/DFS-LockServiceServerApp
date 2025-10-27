@@ -1,68 +1,175 @@
 package dfs.lock;
 
-import io.grpc.stub.StreamObserver;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.locks.Condition;
-import java.util.concurrent.locks.ReentrantLock;
+import dfs.dfs.LockCacheServiceGrpc;
+import dfs.dfs.LockCacheServiceOuterClass;
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
+
 import dfs.lock.LockServiceGrpc;
+import dfs.lock.LockServiceOuterClass;
+import io.grpc.stub.StreamObserver;
 
-import dfs.lock.LockServiceOuterClass.AcquireRequest;
-import dfs.lock.LockServiceOuterClass.AcquireResponse;
-import dfs.lock.LockServiceOuterClass.ReleaseRequest;
-import dfs.lock.LockServiceOuterClass.ReleaseResponse;
-import dfs.lock.LockServiceOuterClass.StopRequest;
-import dfs.lock.LockServiceOuterClass.StopResponse;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.locks.*;
 
-public final class LockServiceImpl extends LockServiceGrpc.LockServiceImplBase {
 
-    private static final class LockState {
-        final ReentrantLock lock = new ReentrantLock();
-        final Condition cond = lock.newCondition();
-        boolean locked = false;
+
+public class LockServiceImpl extends LockServiceGrpc.LockServiceImplBase {
+
+    static class Waiter {
+        final String ownerId;
+        Waiter(String o){ this.ownerId = o; }
     }
 
-    private final ConcurrentHashMap<String, LockState> locks = new ConcurrentHashMap<>();
-    private LockState state(String id) { return locks.computeIfAbsent(id, k -> new LockState()); }
+    static class Row {
+        String holderOwner;
+        long holderSeq = -1;
+        final Deque<Waiter> q = new ArrayDeque<>();
+        boolean revokeSent = false;
+        final Map<String, Long> lastSeqByOwner = new HashMap<>();
+        final ReentrantLock mu = new ReentrantLock();
+    }
 
-    private final Runnable onStop;
-    public LockServiceImpl(Runnable onStop) { this.onStop = onStop; }
+    private final ConcurrentMap<String, Row> table = new ConcurrentHashMap<>();
+    private final BlockingQueue<String> revokerQ = new LinkedBlockingQueue<>();
+    private final BlockingQueue<String> retrierQ = new LinkedBlockingQueue<>();
+    private final Thread revokerThread, retrierThread;
+    private volatile boolean running = true;
+
+    public LockServiceImpl() {
+        revokerThread = new Thread(this::revokerLoop, "revoker");
+        retrierThread = new Thread(this::retrierLoop, "retrier");
+        revokerThread.setDaemon(true);
+        retrierThread.setDaemon(true);
+        revokerThread.start();
+        retrierThread.start();
+    }
+
+    private Row r(String id) { return table.computeIfAbsent(id, k -> new Row()); }
 
     @Override
-    public void acquire(AcquireRequest req, StreamObserver<AcquireResponse> resp) {
+    public void acquire(LockServiceOuterClass.AcquireRequest req,
+                        StreamObserver<LockServiceOuterClass.AcquireResponse> respObs) {
         String id = req.getLockId();
-        LockState st = state(id);
+        String owner = req.getOwnerId();
+        long seq = req.getSequence();
 
-        st.lock.lock();
+        Row row = r(id);
+        row.mu.lock();
         try {
-            while (st.locked) st.cond.awaitUninterruptibly();
-            st.locked = true;
-            resp.onNext(AcquireResponse.newBuilder().setSuccess(true).build());
-            resp.onCompleted();
+            row.lastSeqByOwner.put(owner, Math.max(seq, row.lastSeqByOwner.getOrDefault(owner, -1L)));
+            if (row.holderOwner == null) {
+                row.holderOwner = owner;
+                row.holderSeq = seq;
+                row.revokeSent = false;
+                respObs.onNext(LockServiceOuterClass.AcquireResponse.newBuilder().setSuccess(true).build());
+                respObs.onCompleted();
+            } else if (row.holderOwner.equals(owner)) {
+                respObs.onNext(LockServiceOuterClass.AcquireResponse.newBuilder().setSuccess(true).build());
+                respObs.onCompleted();
+            } else {
+                row.q.addLast(new Waiter(owner));
+                if (!row.revokeSent) {
+                    row.revokeSent = true;
+                    revokerQ.offer(id);
+                }
+                respObs.onNext(LockServiceOuterClass.AcquireResponse.newBuilder().setSuccess(false).build());
+                respObs.onCompleted();
+            }
         } finally {
-            st.lock.unlock();
+            row.mu.unlock();
         }
     }
 
     @Override
-    public void release(ReleaseRequest req, StreamObserver<ReleaseResponse> resp) {
+    public void release(LockServiceOuterClass.ReleaseRequest req,
+                        StreamObserver<LockServiceOuterClass.ReleaseResponse> respObs) {
         String id = req.getLockId();
-        LockState st = state(id);
+        String owner = req.getOwnerId();
 
-        st.lock.lock();
+        Row row = r(id);
+        row.mu.lock();
         try {
-            st.locked = false;
-            st.cond.signalAll();
-            resp.onNext(ReleaseResponse.newBuilder().build());
-            resp.onCompleted();
+            if (owner.equals(row.holderOwner)) {
+                row.holderOwner = null;
+                row.holderSeq = -1;
+                if (!row.q.isEmpty()) {
+                    retrierQ.offer(id);
+                }
+            }
+            respObs.onNext(LockServiceOuterClass.ReleaseResponse.newBuilder().build());
+            respObs.onCompleted();
         } finally {
-            st.lock.unlock();
+            row.mu.unlock();
         }
     }
 
-    @Override
-    public void stop(StopRequest req, StreamObserver<StopResponse> resp) {
-        resp.onNext(StopResponse.getDefaultInstance());
-        resp.onCompleted();
-        if (onStop != null) onStop.run();
+    private void revokerLoop() {
+        while (running) {
+            try {
+                String id = revokerQ.take();
+                Row row = r(id);
+                String holder;
+                row.mu.lock();
+                try { holder = row.holderOwner; } finally { row.mu.unlock(); }
+                if (holder != null) {
+                    callClient(holder, stub -> {
+                        stub.revoke(LockCacheServiceOuterClass.RevokeRequest.newBuilder()
+                                .setLockId(id).build());
+                    });
+                }
+            } catch (InterruptedException ie) {
+            } catch (Exception e) {
+            }
+        }
+    }
+
+
+    private void retrierLoop() {
+        while (running) {
+            try {
+                String id = retrierQ.take();
+                Row row = r(id);
+                java.util.List<String> toNotify = new java.util.ArrayList<>();
+                row.mu.lock();
+                try {
+                    while (!row.q.isEmpty() && row.holderOwner == null) {
+                        toNotify.add(row.q.removeFirst().ownerId);
+                    }
+                    row.revokeSent = false;
+                } finally {
+                    row.mu.unlock();
+                }
+                for (String owner : toNotify) {
+                    long seq = row.lastSeqByOwner.getOrDefault(owner, 0L);
+                    callClient(owner, stub -> {
+                        stub.retry(LockCacheServiceOuterClass.RetryRequest.newBuilder()
+                                .setLockId(id).setSequence(seq).build());
+                    });
+                }
+            } catch (InterruptedException ie) {
+            } catch (Exception e) {
+            }
+        }
+    }
+
+    private void callClient(String ownerId, java.util.function.Consumer<LockCacheServiceGrpc.LockCacheServiceBlockingStub> call) {
+        String[] parts = ownerId.split(":");
+        String host = parts[0];
+        int port = Integer.parseInt(parts[1]);
+        ManagedChannel ch = ManagedChannelBuilder.forAddress(host, port).usePlaintext().build();
+        try {
+            var stub = LockCacheServiceGrpc.newBlockingStub(ch);
+            call.accept(stub);
+        } finally {
+            ch.shutdownNow();
+        }
+    }
+
+    public void stopBackground() {
+        running = false;
+        revokerThread.interrupt();
+        retrierThread.interrupt();
     }
 }
