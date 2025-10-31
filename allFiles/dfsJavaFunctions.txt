@@ -1,0 +1,1035 @@
+// LockServiceServer.java
+package dfs.lock;
+
+import io.grpc.Server;
+import io.grpc.ServerBuilder;
+import io.grpc.stub.StreamObserver;
+
+public class LockServiceServer {
+
+    private final int port;
+    private Server server;
+    private LockServiceImpl impl;
+
+    public LockServiceServer(int port) { this.port = port; }
+
+    public void start() throws Exception {
+        impl = new LockServiceImpl();
+        server = ServerBuilder.forPort(port)
+                .addService(impl)
+                .build()
+                .start();
+        System.out.printf("Lock Service started on port %d%n", port);
+
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            if (server != null) server.shutdown();
+            if (impl != null) impl.stopBackground();
+        }));
+    }
+
+    public void blockUntilShutdown() throws InterruptedException {
+        if (server != null) server.awaitTermination();
+    }
+
+    public static void main(String[] args) throws Exception {
+        if (args.length < 1) { System.exit(1); }
+        var srv = new LockServiceServer(Integer.parseInt(args[0]));
+        srv.start();
+        srv.blockUntilShutdown();
+    }
+
+    public static class StopHandler extends LockServiceGrpc.LockServiceImplBase {
+        private final Runnable onStop;
+        public StopHandler(Runnable onStop) { this.onStop = onStop; }
+        @Override public void stop(dfs.lock.LockServiceOuterClass.StopRequest req,
+                                   io.grpc.stub.StreamObserver<dfs.lock.LockServiceOuterClass.StopResponse> resp) {
+            resp.onNext(dfs.lock.LockServiceOuterClass.StopResponse.newBuilder().build());
+            resp.onCompleted();
+            if (onStop != null) new Thread(onStop).start();
+        }
+    }
+}
+
+// LockServiceImpl.java
+package dfs.lock;
+
+import dfs.dfs.LockCacheServiceGrpc;
+import dfs.dfs.LockCacheServiceOuterClass;
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
+
+import dfs.lock.LockServiceGrpc;
+import dfs.lock.LockServiceOuterClass;
+import io.grpc.stub.StreamObserver;
+
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.locks.*;
+
+
+public class LockServiceImpl extends LockServiceGrpc.LockServiceImplBase {
+
+    static class Waiter {
+        final String ownerId;
+        Waiter(String o){ this.ownerId = o; }
+    }
+
+    static class Row {
+        String holderOwner;
+        long holderSeq = -1;
+        final Deque<Waiter> q = new ArrayDeque<>();
+        boolean revokeSent = false;
+        final Map<String, Long> lastSeqByOwner = new HashMap<>();
+        final ReentrantLock mu = new ReentrantLock();
+    }
+
+    private final ConcurrentMap<String, Row> table = new ConcurrentHashMap<>();
+    private final BlockingQueue<String> revokerQ = new LinkedBlockingQueue<>();
+    private final BlockingQueue<String> retrierQ = new LinkedBlockingQueue<>();
+    private final Thread revokerThread, retrierThread;
+    private volatile boolean running = true;
+
+    public LockServiceImpl() {
+        revokerThread = new Thread(this::revokerLoop, "revoker");
+        retrierThread = new Thread(this::retrierLoop, "retrier");
+        revokerThread.setDaemon(true);
+        retrierThread.setDaemon(true);
+        revokerThread.start();
+        retrierThread.start();
+    }
+
+    private Row r(String id) { return table.computeIfAbsent(id, k -> new Row()); }
+
+    @Override
+    public void acquire(LockServiceOuterClass.AcquireRequest req,
+                        StreamObserver<LockServiceOuterClass.AcquireResponse> respObs) {
+        String id = req.getLockId();
+        String owner = req.getOwnerId();
+        long seq = req.getSequence();
+
+        Row row = r(id);
+        row.mu.lock();
+        try {
+            row.lastSeqByOwner.put(owner, Math.max(seq, row.lastSeqByOwner.getOrDefault(owner, -1L)));
+            if (row.holderOwner == null) {
+                row.holderOwner = owner;
+                row.holderSeq = seq;
+                row.revokeSent = false;
+                respObs.onNext(LockServiceOuterClass.AcquireResponse.newBuilder().setSuccess(true).build());
+                respObs.onCompleted();
+            } else if (row.holderOwner.equals(owner)) {
+                respObs.onNext(LockServiceOuterClass.AcquireResponse.newBuilder().setSuccess(true).build());
+                respObs.onCompleted();
+            } else {
+                row.q.addLast(new Waiter(owner));
+                if (!row.revokeSent) {
+                    row.revokeSent = true;
+                    revokerQ.offer(id);
+                }
+                respObs.onNext(LockServiceOuterClass.AcquireResponse.newBuilder().setSuccess(false).build());
+                respObs.onCompleted();
+            }
+        } finally {
+            row.mu.unlock();
+        }
+    }
+
+    @Override
+    public void release(LockServiceOuterClass.ReleaseRequest req,
+                        StreamObserver<LockServiceOuterClass.ReleaseResponse> respObs) {
+        String id = req.getLockId();
+        String owner = req.getOwnerId();
+
+        Row row = r(id);
+        row.mu.lock();
+        try {
+            if (owner.equals(row.holderOwner)) {
+                row.holderOwner = null;
+                row.holderSeq = -1;
+                if (!row.q.isEmpty()) {
+                    retrierQ.offer(id);
+                }
+            }
+            respObs.onNext(LockServiceOuterClass.ReleaseResponse.newBuilder().build());
+            respObs.onCompleted();
+        } finally {
+            row.mu.unlock();
+        }
+    }
+
+    private void revokerLoop() {
+        while (running) {
+            try {
+                String id = revokerQ.take();
+                Row row = r(id);
+                String holder;
+                row.mu.lock();
+                try { holder = row.holderOwner; } finally { row.mu.unlock(); }
+                if (holder != null) {
+                    callClient(holder, stub -> {
+                        stub.revoke(LockCacheServiceOuterClass.RevokeRequest.newBuilder()
+                                .setLockId(id).build());
+                    });
+                }
+            } catch (InterruptedException ie) {
+                // stop
+            } catch (Exception e) {
+                // TODO
+            }
+        }
+    }
+
+
+    private void retrierLoop() {
+        while (running) {
+            try {
+                String id = retrierQ.take();
+                Row row = r(id);
+                java.util.List<String> toNotify = new java.util.ArrayList<>();
+                row.mu.lock();
+                try {
+                    while (!row.q.isEmpty() && row.holderOwner == null) {
+                        toNotify.add(row.q.removeFirst().ownerId);
+                    }
+                    row.revokeSent = false;
+                } finally {
+                    row.mu.unlock();
+                }
+                for (String owner : toNotify) {
+                    long seq = row.lastSeqByOwner.getOrDefault(owner, 0L);
+                    callClient(owner, stub -> {
+                        stub.retry(LockCacheServiceOuterClass.RetryRequest.newBuilder()
+                                .setLockId(id).setSequence(seq).build());
+                    });
+                }
+            } catch (InterruptedException ie) {
+                // stop
+            } catch (Exception e) {
+                // TODO
+            }
+        }
+    }
+
+    private void callClient(String ownerId, java.util.function.Consumer<LockCacheServiceGrpc.LockCacheServiceBlockingStub> call) {
+        String[] parts = ownerId.split(":");
+        String host = parts[0];
+        int port = Integer.parseInt(parts[1]);
+        ManagedChannel ch = ManagedChannelBuilder.forAddress(host, port).usePlaintext().build();
+        try {
+            var stub = LockCacheServiceGrpc.newBlockingStub(ch);
+            call.accept(stub);
+        } finally {
+            ch.shutdownNow();
+        }
+    }
+
+    public void stopBackground() {
+        running = false;
+        revokerThread.interrupt();
+        retrierThread.interrupt();
+    }
+}
+
+// ExtentServiceServer.java
+package dfs.extent;
+
+import io.grpc.Server;
+import io.grpc.ServerBuilder;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+
+public class ExtentServiceServer {
+    private Server server;
+    private final int port;
+    private final Path extentRoot;
+
+    public ExtentServiceServer(int port, String rootStr) {
+        this.port = port;
+        this.extentRoot = Paths.get(rootStr).toAbsolutePath().normalize();
+        try { Files.createDirectories(this.extentRoot); }
+        catch (IOException e) { System.err.println("FATAL: " + e.getMessage()); System.exit(1); }
+    }
+
+    public void start() throws IOException {
+        ExtentServiceImpl service = new ExtentServiceImpl(extentRoot, this::stop);
+        server = ServerBuilder.forPort(port).addService(service).build().start();
+        System.out.println("Extent Service started on " + port + " root=" + extentRoot);
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> { System.err.println("JVM shutdown"); stop(); }));
+    }
+
+    public void stop() {
+        if (server != null) {
+            System.out.println("Stopping Extent Service...");
+            server.shutdown();
+            try {
+                if (!server.awaitTermination(2, java.util.concurrent.TimeUnit.SECONDS)) server.shutdownNow();
+            } catch (InterruptedException e) { server.shutdownNow(); Thread.currentThread().interrupt(); }
+        }
+    }
+
+    public void blockUntilShutdown() throws InterruptedException {
+        if (server != null) {
+            server.awaitTermination();
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        if (args.length == 2 && "stop".equalsIgnoreCase(args[0]) && args[1].contains(":")) {
+            var hp = args[1].split(":",2);
+            var ch = io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder
+                    .forAddress(hp[0], Integer.parseInt(hp[1])).usePlaintext().build();
+            try { ExtentServiceGrpc.newBlockingStub(ch).stop(ExtentServiceOuterClass.StopRequest.getDefaultInstance());
+                System.out.println("Stop RPC sent to " + args[1]); }
+            finally { ch.shutdownNow(); }
+            return;
+        }
+        if (args.length != 2) {
+            System.err.println("Usage:\n  Start: java -jar <jar> <port> <extentRoot>\n   Stop: java -jar <jar> stop <host:port>");
+            System.exit(1);
+        }
+        int port = Integer.parseInt(args[0]);
+        ExtentServiceServer srv = new ExtentServiceServer(port, args[1]);
+        srv.start();
+        srv.blockUntilShutdown();
+    }
+}
+
+
+//ExtentServiceImpl.java
+package dfs.extent;
+
+import io.grpc.Status;
+import io.grpc.stub.StreamObserver;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.ArrayList;
+import java.util.List;
+
+import dfs.extent.ExtentServiceOuterClass.GetRequest;
+import dfs.extent.ExtentServiceOuterClass.GetResponse;
+import dfs.extent.ExtentServiceOuterClass.PutRequest;
+import dfs.extent.ExtentServiceOuterClass.PutResponse;
+import dfs.extent.ExtentServiceOuterClass.StopRequest;
+import dfs.extent.ExtentServiceOuterClass.StopResponse;
+
+public class ExtentServiceImpl extends ExtentServiceGrpc.ExtentServiceImplBase {
+
+    private final Path rootPath;
+    private final Runnable shutdownCallback;
+
+    public ExtentServiceImpl(Path rootPath, Runnable shutdownCallback) {
+        this.rootPath = rootPath.normalize().toAbsolutePath();
+        this.shutdownCallback = shutdownCallback;
+    }
+    // ---- Helpers ----
+    private static boolean isDirectoryName(String dfsName) {
+        return dfsName != null && dfsName.endsWith("/");
+    }
+
+    private Path mapToRealPath(String dfsName) {
+        String cleaned = dfsName;
+        if (cleaned.startsWith("/")) cleaned = cleaned.substring(1);
+        if (cleaned.endsWith("/")) cleaned = cleaned.substring(0, cleaned.length() - 1);
+        Path p = rootPath.resolve(cleaned).normalize();
+        if (!p.startsWith(rootPath)) {
+            return rootPath.resolve("_denied_").resolve("x");
+        }
+        return p;
+    }
+
+    private byte[] dirListingBytes(Path dir) throws IOException {
+        if (!Files.exists(dir) || !Files.isDirectory(dir)) {
+            return null;
+        }
+        List<String> names = new ArrayList<>();
+        try (DirectoryStream<Path> ds = Files.newDirectoryStream(dir)) {
+            for (Path child : ds) {
+                String name = child.getFileName().toString();
+                if (Files.isDirectory(child)) {
+                    names.add(name + "/");
+                } else {
+                    names.add(name);
+                }
+            }
+        }
+
+        String joined = String.join("\n", names);
+        return joined.getBytes(StandardCharsets.UTF_8);
+    }
+
+    @Override
+    public void stop(StopRequest request, StreamObserver<StopResponse> responseObserver) {
+        responseObserver.onNext(StopResponse.newBuilder().build());
+        responseObserver.onCompleted();
+        if (shutdownCallback != null) {
+            new Thread(shutdownCallback).start();
+        }
+    }
+
+    @Override
+    public void get(GetRequest request, StreamObserver<GetResponse> responseObserver) {
+        String dfsName = request.getFileName();
+        if (dfsName == null || dfsName.isEmpty()) {
+            responseObserver.onError(Status.INVALID_ARGUMENT.withDescription("fileName is required").asRuntimeException());
+            return;
+        }
+
+        Path real = mapToRealPath(dfsName);
+        try {
+            GetResponse.Builder b = GetResponse.newBuilder();
+
+            if (isDirectoryName(dfsName)) {
+                byte[] listing = dirListingBytes(real);
+                if (listing != null) {
+                    b.setFileData(com.google.protobuf.ByteString.copyFrom(listing));
+                }
+
+                responseObserver.onNext(b.build());
+                responseObserver.onCompleted();
+                return;
+            } else {
+                if (Files.exists(real) && Files.isRegularFile(real)) {
+                    byte[] data = Files.readAllBytes(real);
+                    b.setFileData(com.google.protobuf.ByteString.copyFrom(data));
+                }
+
+                responseObserver.onNext(b.build());
+                responseObserver.onCompleted();
+                return;
+            }
+        } catch (Exception e) {
+            responseObserver.onNext(GetResponse.newBuilder().build());
+            responseObserver.onCompleted();
+        }
+    }
+
+    @Override
+    public void put(PutRequest request, StreamObserver<PutResponse> responseObserver) {
+        String dfsName = request.getFileName();
+        boolean hasData = request.hasFileData();
+
+        if (dfsName == null || dfsName.isEmpty()) {
+            responseObserver.onError(Status.INVALID_ARGUMENT.withDescription("fileName is required").asRuntimeException());
+            return;
+        }
+
+        Path real = mapToRealPath(dfsName);
+        boolean success = false;
+
+        try {
+            if (isDirectoryName(dfsName)) {
+
+                if (hasData) {
+
+                    Files.createDirectories(real);
+                    success = Files.isDirectory(real);
+                } else {
+
+                    if (Files.exists(real) && Files.isDirectory(real)) {
+                        try (DirectoryStream<Path> ds = Files.newDirectoryStream(real)) {
+                            if (!ds.iterator().hasNext()) {
+                                Files.delete(real);
+                                success = !Files.exists(real);
+                            } else {
+                                success = false;
+                            }
+                        }
+                    } else {
+                        success = false;
+                    }
+                }
+            } else {
+                if (hasData) {
+                    if (real.getParent() != null) Files.createDirectories(real.getParent());
+                    byte[] data = request.getFileData().toByteArray();
+                    Files.write(real, data, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+                    success = Files.exists(real) && Files.isRegularFile(real);
+                } else {
+                    if (Files.exists(real) && Files.isRegularFile(real)) {
+                        Files.delete(real);
+                        success = !Files.exists(real);
+                    } else {
+                        success = false;
+                    }
+                }
+            }
+        } catch (IOException e) {
+            success = false;
+        }
+
+        responseObserver.onNext(PutResponse.newBuilder().setSuccess(success).build());
+        responseObserver.onCompleted();
+    }
+}
+
+// DfsServiceServer.java
+package dfs.dfs;
+
+import dfs.extent.ExtentServiceGrpc;
+import dfs.lock.LockServiceGrpc;
+import io.grpc.ManagedChannel;
+import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder;
+import io.grpc.ManagedChannelBuilder;
+import io.grpc.Server;
+import io.grpc.ServerBuilder;
+
+public class DfsServiceServer {
+
+    private final int port;
+    private final String extentAddr;
+    private final String lockAddr;
+    private Server server;
+    private ManagedChannel extentCh, lockCh;
+
+    public DfsServiceServer(int port, String extentAddr, String lockAddr) {
+        this.port = port;
+        this.extentAddr = extentAddr;
+        this.lockAddr = lockAddr;
+    }
+
+    public void start() throws Exception {
+        extentCh = buildChannel(extentAddr);
+        lockCh   = buildChannel(lockAddr);
+
+        var extentStub = ExtentServiceGrpc.newBlockingStub(extentCh);
+        var lockStub = LockServiceGrpc.newBlockingStub(lockCh);
+        String ownerId = OwnerIdUtil.buildOwnerId(port);
+        var lockClient = new LockClient(lockStub, ownerId);
+        Runnable shutdownCb = () -> {
+            System.out.println("Stopping DFS Server.");
+            if (server != null) server.shutdown();
+            lockClient.stop();
+        };
+
+        var impl = new DfsServiceImpl(extentStub, lockClient, shutdownCb);
+
+        server = ServerBuilder.forPort(port)
+                .addService(impl)
+                .addService(new LockCacheServiceImpl(lockClient))
+                .build()
+                .start();
+
+        System.out.printf("DFS Server started on port %d (Extent %s, Lock %s, OwnerId %s)%n",
+                port, extentAddr, lockAddr, ownerId);
+
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            if (server != null) server.shutdown();
+            if (extentCh != null) extentCh.shutdownNow();
+            if (lockCh != null) lockCh.shutdownNow();
+            lockClient.stop();
+        }));
+    }
+
+    public void blockUntilShutdown() throws InterruptedException {
+        if (server != null) server.awaitTermination();
+    }
+
+    private static ManagedChannel buildChannel(String hostPort) {
+        String[] hp = hostPort.split(":", 2);
+        String host = hp[0];
+        int port = Integer.parseInt(hp[1]);
+        return io.grpc.ManagedChannelBuilder
+                .forAddress(host, port)
+                .usePlaintext()
+                .build();
+    }
+
+    public static void main(String[] args) throws Exception {
+        if (args.length < 3) {
+            System.err.println("Usage: java dfs.dfs.DfsServiceServer <port> <extentHost:port> <lockHost:port>");
+            System.exit(1);
+        }
+        int port = Integer.parseInt(args[0]);
+        String extent = args[1];
+        String lock = args[2];
+
+        DfsServiceServer srv = new DfsServiceServer(port, extent, lock);
+        srv.start();
+        srv.blockUntilShutdown();
+    }
+}
+
+// DfsServiceImpl.java
+package dfs.dfs;
+
+import com.google.protobuf.ByteString;
+import dfs.extent.ExtentServiceGrpc;
+import dfs.extent.ExtentServiceOuterClass;
+import dfs.lock.LockServiceGrpc;
+import dfs.lock.LockServiceOuterClass;
+import io.grpc.stub.StreamObserver;
+
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+import java.util.List;
+
+public class DfsServiceImpl extends DfsServiceGrpc.DfsServiceImplBase {
+
+    private final ExtentServiceGrpc.ExtentServiceBlockingStub extent;
+    private final LockClient lockClient;
+    private final Runnable shutdownCb;
+
+    public DfsServiceImpl(ExtentServiceGrpc.ExtentServiceBlockingStub extent,
+                          LockClient lockClient,
+                          Runnable shutdownCb) {
+        this.extent = extent;
+        this.lockClient = lockClient;
+        this.shutdownCb = shutdownCb;
+    }
+
+    private static boolean isDir(String name) { return name != null && name.endsWith("/"); }
+
+    private void acquire(String id) { lockClient.acquire(id); }
+    private void release(String id) { lockClient.release(id); }
+
+    private List<String> parseDirListing(byte[] data) {
+        String text = new String(data, StandardCharsets.UTF_8);
+        if (text.isEmpty()) return List.of();
+        return Arrays.asList(text.split("\n"));
+    }
+
+    @Override
+    public void stop(dfs.dfs.DfsServiceOuterClass.StopRequest request,
+                     StreamObserver<dfs.dfs.DfsServiceOuterClass.StopResponse> responseObserver) {
+        responseObserver.onNext(dfs.dfs.DfsServiceOuterClass.StopResponse.newBuilder().build());
+        responseObserver.onCompleted();
+        if (shutdownCb != null) new Thread(shutdownCb).start();
+    }
+
+    @Override
+    public void dir(dfs.dfs.DfsServiceOuterClass.DirRequest request,
+                    StreamObserver<dfs.dfs.DfsServiceOuterClass.DirResponse> responseObserver) {
+
+        String dirName = request.getDirectoryName();
+        if (!isDir(dirName)) {
+            responseObserver.onNext(dfs.dfs.DfsServiceOuterClass.DirResponse.newBuilder()
+                    .setSuccess(false).build());
+            responseObserver.onCompleted();
+            return;
+        }
+
+        acquire(dirName);
+        try {
+            var resp = extent.get(ExtentServiceOuterClass.GetRequest.newBuilder()
+                    .setFileName(dirName).build());
+
+            if (!resp.hasFileData()) {
+                responseObserver.onNext(dfs.dfs.DfsServiceOuterClass.DirResponse.newBuilder()
+                        .setSuccess(false).build());
+            } else {
+                var list = parseDirListing(resp.getFileData().toByteArray());
+                var b = dfs.dfs.DfsServiceOuterClass.DirResponse.newBuilder()
+                        .setSuccess(true).addAllDirList(list);
+                responseObserver.onNext(b.build());
+            }
+            responseObserver.onCompleted();
+        } finally {
+            release(dirName);
+        }
+    }
+
+    @Override
+    public void mkdir(dfs.dfs.DfsServiceOuterClass.MkdirRequest request,
+                      StreamObserver<dfs.dfs.DfsServiceOuterClass.MkdirResponse> responseObserver) {
+        String dirName = request.getDirectoryName();
+        if (!isDir(dirName)) {
+            responseObserver.onNext(dfs.dfs.DfsServiceOuterClass.MkdirResponse.newBuilder()
+                    .setSuccess(false).build());
+            responseObserver.onCompleted();
+            return;
+        }
+
+        acquire(dirName);
+        try {
+            var put = ExtentServiceOuterClass.PutRequest.newBuilder()
+                    .setFileName(dirName)
+                    .setFileData(ByteString.copyFrom(new byte[]{1}))
+                    .build();
+            boolean ok = extent.put(put).getSuccess();
+            responseObserver.onNext(dfs.dfs.DfsServiceOuterClass.MkdirResponse.newBuilder()
+                    .setSuccess(ok).build());
+            responseObserver.onCompleted();
+        } finally {
+            release(dirName);
+        }
+    }
+
+    @Override
+    public void rmdir(dfs.dfs.DfsServiceOuterClass.RmdirRequest request,
+                      StreamObserver<dfs.dfs.DfsServiceOuterClass.RmdirResponse> responseObserver) {
+        String dirName = request.getDirectoryName();
+        if (!isDir(dirName)) {
+            responseObserver.onNext(dfs.dfs.DfsServiceOuterClass.RmdirResponse.newBuilder()
+                    .setSuccess(false).build());
+            responseObserver.onCompleted();
+            return;
+        }
+
+        acquire(dirName);
+        try {
+            var put = ExtentServiceOuterClass.PutRequest.newBuilder()
+                    .setFileName(dirName) // bez fileData → delete dir
+                    .build();
+            boolean ok = extent.put(put).getSuccess();
+            responseObserver.onNext(dfs.dfs.DfsServiceOuterClass.RmdirResponse.newBuilder()
+                    .setSuccess(ok).build());
+            responseObserver.onCompleted();
+        } finally {
+            release(dirName);
+        }
+    }
+
+    @Override
+    public void get(dfs.dfs.DfsServiceOuterClass.GetRequest request,
+                    StreamObserver<dfs.dfs.DfsServiceOuterClass.GetResponse> responseObserver) {
+        String fileName = request.getFileName();
+        if (isDir(fileName)) {
+            responseObserver.onNext(dfs.dfs.DfsServiceOuterClass.GetResponse.newBuilder().build());
+            responseObserver.onCompleted();
+            return;
+        }
+
+        acquire(fileName);
+        try {
+            var resp = extent.get(ExtentServiceOuterClass.GetRequest.newBuilder()
+                    .setFileName(fileName).build());
+            var b = dfs.dfs.DfsServiceOuterClass.GetResponse.newBuilder();
+            if (resp.hasFileData()) b.setFileData(resp.getFileData());
+            responseObserver.onNext(b.build());
+            responseObserver.onCompleted();
+        } finally {
+            release(fileName);
+        }
+    }
+
+    @Override
+    public void put(dfs.dfs.DfsServiceOuterClass.PutRequest request,
+                    StreamObserver<dfs.dfs.DfsServiceOuterClass.PutResponse> responseObserver) {
+        String fileName = request.getFileName();
+        if (isDir(fileName) || !request.hasFileData()) {
+            responseObserver.onNext(dfs.dfs.DfsServiceOuterClass.PutResponse.newBuilder()
+                    .setSuccess(false).build());
+            responseObserver.onCompleted();
+            return;
+        }
+
+        acquire(fileName);
+        try {
+            var put = ExtentServiceOuterClass.PutRequest.newBuilder()
+                    .setFileName(fileName)
+                    .setFileData(request.getFileData())
+                    .build();
+            boolean ok = extent.put(put).getSuccess();
+            responseObserver.onNext(dfs.dfs.DfsServiceOuterClass.PutResponse.newBuilder()
+                    .setSuccess(ok).build());
+            responseObserver.onCompleted();
+        } finally {
+            release(fileName);
+        }
+    }
+
+    @Override
+    public void delete(dfs.dfs.DfsServiceOuterClass.DeleteRequest request,
+                       StreamObserver<dfs.dfs.DfsServiceOuterClass.DeleteResponse> responseObserver) {
+        String fileName = request.getFileName();
+        if (isDir(fileName)) {
+            responseObserver.onNext(dfs.dfs.DfsServiceOuterClass.DeleteResponse.newBuilder()
+                    .setSuccess(false).build());
+            responseObserver.onCompleted();
+            return;
+        }
+
+        acquire(fileName);
+        try {
+            var put = ExtentServiceOuterClass.PutRequest.newBuilder()
+                    .setFileName(fileName)
+                    .build();
+            boolean ok = extent.put(put).getSuccess();
+            responseObserver.onNext(dfs.dfs.DfsServiceOuterClass.DeleteResponse.newBuilder()
+                    .setSuccess(ok).build());
+            responseObserver.onCompleted();
+        } finally {
+            release(fileName);
+        }
+    }
+}
+
+// LockClient.java
+package dfs.dfs;
+
+import dfs.lock.LockServiceGrpc;
+import dfs.lock.LockServiceOuterClass;
+
+import java.util.Map;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
+
+public class LockClient {
+    public enum State { None, Free, Locked, Acquiring, Releasing }
+
+    static class Entry {
+        final ReentrantLock mu = new ReentrantLock();
+        final Condition cv = mu.newCondition();
+        State state = State.None;
+        int waiters = 0;
+        boolean revoked = false;
+        long lastSeq = -1;
+    }
+
+    private final Map<String, Entry> table = new ConcurrentHashMap<>();
+    private final LockServiceGrpc.LockServiceBlockingStub lockStub;
+    private final String ownerId;
+    private final AtomicLong nextSeq = new AtomicLong(1);
+    private final BlockingQueue<String> toRelease = new LinkedBlockingQueue<>();
+    private final Thread releaserThread;
+    private volatile boolean running = true;
+
+    public LockClient(LockServiceGrpc.LockServiceBlockingStub lockStub, String ownerId) {
+        this.lockStub = lockStub;
+        this.ownerId = ownerId;
+        this.releaserThread = new Thread(this::releaserLoop, "lock-releaser");
+        this.releaserThread.setDaemon(true);
+        this.releaserThread.start();
+    }
+
+    private Entry e(String id) { return table.computeIfAbsent(id, k -> new Entry()); }
+
+    public void acquire(String id) {
+        Entry e = e(id);
+        e.mu.lock();
+        try {
+            while (true) {
+                if (e.state == State.Locked || e.state == State.Free) {
+                    e.state = State.Locked;
+                    return;
+                }
+
+                if (e.state == State.None || e.state == State.Acquiring) {
+                    long seq = nextSeq.getAndIncrement();
+                    e.lastSeq = seq;
+                    e.state = State.Acquiring;
+
+                    e.mu.unlock();
+                    boolean ok = rpcAcquire(id, seq);
+                    e.mu.lock();
+
+                    if (ok) {
+                        e.state = State.Locked;
+                        return;
+                    }
+                }
+
+                try { e.cv.await(); }
+                catch (InterruptedException ex) { Thread.currentThread().interrupt(); }
+            }
+        } finally {
+            e.mu.unlock();
+        }
+    }
+
+    public void release(String id) {
+        Entry e = e(id);
+        e.mu.lock();
+        try {
+            if (e.state == State.Locked) {
+                if (e.revoked) {
+                    e.state = State.Releasing;
+                    toRelease.offer(id);
+                } else {
+                    e.state = State.Free;
+                }
+                e.cv.signalAll();
+            }
+        } finally {
+            e.mu.unlock();
+        }
+    }
+
+    public void onRevoke(String id) {
+        Entry e = e(id);
+        e.mu.lock();
+        try {
+            e.revoked = true;
+
+            if (e.state == State.Free) {
+                e.state = State.Releasing;
+                toRelease.offer(id);
+            }
+
+            e.cv.signalAll();
+        } finally {
+            e.mu.unlock();
+        }
+    }
+
+    public void onRetry(String id, long seq) {
+        Entry e = e(id);
+        e.mu.lock();
+        try {
+            e.cv.signalAll();
+        } finally {
+            e.mu.unlock();
+        }
+    }
+
+    public void stop() {
+        running = false;
+        releaserThread.interrupt();
+    }
+
+    private boolean rpcAcquire(String id, long seq) {
+        try {
+            var resp = lockStub.acquire(LockServiceOuterClass.AcquireRequest.newBuilder()
+                    .setLockId(id).setOwnerId(ownerId).setSequence(seq).build());
+            return resp.getSuccess();
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private void rpcRelease(String id, long seq) {
+        try {
+            lockStub.release(LockServiceOuterClass.ReleaseRequest.newBuilder()
+                    .setLockId(id).setOwnerId(ownerId).build());
+        } catch (Exception e) {
+        }
+    }
+
+    private void releaserLoop() {
+        while (running) {
+            try {
+                String id = toRelease.take();
+                Entry e = e(id);
+
+                long seq;
+                e.mu.lock();
+                try {
+                    seq = e.lastSeq;
+                } finally {
+                    e.mu.unlock();
+                }
+
+                rpcRelease(id, seq);
+
+                e.mu.lock();
+                try {
+                    e.revoked = false;
+                    e.state = State.None;
+                    e.cv.signalAll();
+                } finally {
+                    e.mu.unlock();
+                }
+
+            } catch (InterruptedException ie) {
+                break;
+            }
+        }
+    }
+}
+
+// LockCacheServiceImpl.java
+package dfs.dfs;
+
+import dfs.dfs.LockCacheServiceGrpc;
+import dfs.dfs.LockCacheServiceOuterClass;
+import io.grpc.stub.StreamObserver;
+
+//import dfs.dfs.LockCacheServiceGrpc.LockCacheServiceImplBase;
+//import dfs.dfs.DfsServiceOuterClass.RevokeRequest;
+//import dfs.dfs.DfsServiceOuterClass.RevokeResponse;
+//import dfs.dfs.DfsServiceOuterClass.RetryRequest;
+//import dfs.dfs.DfsServiceOuterClass.RetryResponse;
+//import io.grpc.stub.StreamObserver;
+//
+
+//public class LockCacheServiceImpl extends LockCacheServiceImplBase {
+//
+//    private final LockClient client;
+//
+//    public LockCacheServiceImpl(LockClient client) {
+//        this.client = client;
+//    }
+//
+//    @Override
+//    public void revoke(RevokeRequest request, StreamObserver<RevokeResponse> responseObserver) {
+//        client.onRevoke(request.getLockId()); // neblokovať – handler má dobehnúť. :contentReference[oaicite:8]{index=8}
+//        responseObserver.onNext(RevokeResponse.newBuilder().build());
+//        responseObserver.onCompleted();
+//    }
+//
+//    @Override
+//    public void retry(RetryRequest request, StreamObserver<RetryResponse> responseObserver) {
+//        client.onRetry(request.getLockId(), request.getSequence());
+//        responseObserver.onNext(RetryResponse.newBuilder().build());
+//        responseObserver.onCompleted();
+//    }
+//}
+
+public class LockCacheServiceImpl extends LockCacheServiceGrpc.LockCacheServiceImplBase {
+
+    private final dfs.dfs.LockClient client;
+
+    public LockCacheServiceImpl(dfs.dfs.LockClient client) { this.client = client; }
+
+    @Override
+    public void revoke(LockCacheServiceOuterClass.RevokeRequest req,
+                       StreamObserver<LockCacheServiceOuterClass.RevokeResponse> rsp) {
+        client.onRevoke(req.getLockId());
+        rsp.onNext(LockCacheServiceOuterClass.RevokeResponse.newBuilder().build());
+        rsp.onCompleted();
+    }
+
+    @Override
+    public void retry(LockCacheServiceOuterClass.RetryRequest req,
+                      StreamObserver<LockCacheServiceOuterClass.RetryResponse> rsp) {
+        client.onRetry(req.getLockId(), req.getSequence());
+        rsp.onNext(LockCacheServiceOuterClass.RetryResponse.newBuilder().build());
+        rsp.onCompleted();
+    }
+}
+
+// OwnerIdUtil.javapackage dfs.dfs;
+
+import java.net.*;
+import java.util.Enumeration;
+import java.util.UUID;
+
+public final class OwnerIdUtil {
+    private OwnerIdUtil(){}
+
+    public static String buildOwnerId(int dfsPort) {
+        String ip = detectNonLoopbackIPv4();
+        String name = UUID.randomUUID().toString().substring(0,8);
+        return ip + ":" + dfsPort + ":" + name;
+    }
+
+    static String detectNonLoopbackIPv4() {
+        try {
+            String fallback = null;
+            for (java.util.Enumeration<java.net.NetworkInterface> en = java.net.NetworkInterface.getNetworkInterfaces(); en.hasMoreElements();) {
+                java.net.NetworkInterface ni = en.nextElement();
+                if (!ni.isUp() || ni.isLoopback() || ni.isVirtual()) continue;
+                for (java.util.Enumeration<java.net.InetAddress> ads = ni.getInetAddresses(); ads.hasMoreElements();) {
+                    java.net.InetAddress a = ads.nextElement();
+                    if (a instanceof java.net.Inet4Address && !a.isLoopbackAddress()) {
+                        if (a.isSiteLocalAddress()) return a.getHostAddress();
+                        if (fallback == null) fallback = a.getHostAddress();
+                    }
+                }
+            }
+            if (fallback != null) return fallback;
+        } catch (Exception ignored) {}
+        return "127.0.0.1";
+    }
+
+}

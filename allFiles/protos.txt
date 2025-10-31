@@ -1,0 +1,280 @@
+// LockserviceProto
+syntax = "proto3";
+
+package dfs.lock;
+
+service LockService {
+  rpc stop(StopRequest) returns (StopResponse);
+  rpc acquire(AcquireRequest) returns (AcquireResponse);
+  rpc release(ReleaseRequest) returns (ReleaseResponse);
+}
+
+message StopRequest {
+}
+
+message StopResponse {
+}
+
+message AcquireRequest {
+  string lockId = 1;
+  string ownerId = 2;
+  int64 sequence = 3;
+}
+
+message AcquireResponse {
+  bool success = 1;
+}
+
+message ReleaseRequest {
+  string lockId = 1;
+  string ownerId = 2;
+}
+
+message ReleaseResponse {
+}
+
+// LockCacheServiceProto
+syntax = "proto3";
+
+package dfs.dfs;
+
+service LockCacheService {
+  rpc revoke(RevokeRequest) returns (RevokeResponse);
+  rpc retry(RetryRequest) returns (RetryResponse);
+}
+
+message RevokeRequest {
+  string lockId = 1;
+}
+
+message RevokeResponse {
+}
+
+message RetryRequest {
+  string lockId = 1;
+  int64 sequence = 2;
+}
+
+message RetryResponse {
+}
+
+// ExtentServiceProto
+syntax = "proto3";
+
+package dfs.extent;
+
+service ExtentService {
+  rpc stop(StopRequest) returns (StopResponse);
+  rpc get(GetRequest) returns (GetResponse);
+  rpc put(PutRequest) returns (PutResponse);
+}
+
+message StopRequest {
+}
+
+message StopResponse {
+}
+
+message GetRequest {
+  string fileName = 1;
+}
+
+message GetResponse {
+  optional bytes fileData = 1;
+}
+
+message PutRequest {
+  string fileName = 1;
+  optional bytes fileData = 2;
+}
+
+message PutResponse {
+  bool success = 1;
+}
+
+//DfsServiceProto
+syntax = "proto3";
+
+package dfs.dfs;
+
+service DfsService {
+  rpc stop(StopRequest) returns (StopResponse);
+  rpc dir(DirRequest) returns (DirResponse);
+  rpc mkdir(MkdirRequest) returns (MkdirResponse);
+  rpc rmdir(RmdirRequest) returns (RmdirResponse);
+  rpc get(GetRequest) returns (GetResponse);
+  rpc put(PutRequest) returns (PutResponse);
+  rpc delete(DeleteRequest) returns (DeleteResponse);
+}
+
+message StopRequest {
+}
+
+message StopResponse {
+}
+
+message DirRequest {
+  string directoryName = 1;
+}
+
+message DirResponse {
+  bool success = 1;
+  repeated string dirList = 2;
+}
+
+message MkdirRequest {
+  string directoryName = 1;
+}
+
+message MkdirResponse {
+  bool success = 1;
+}
+
+message RmdirRequest {
+  string directoryName = 1;
+}
+
+message RmdirResponse {
+  bool success = 1;
+}
+
+message GetRequest {
+  string fileName = 1;
+}
+
+message GetResponse {
+  optional bytes fileData = 1;
+}
+
+message PutRequest {
+  string fileName = 1;
+  optional bytes fileData = 2;
+}
+
+message PutResponse {
+  bool success = 1;
+}
+
+message DeleteRequest {
+  string fileName = 1;
+}
+
+message DeleteResponse {
+  bool success = 1;
+}
+
+// ManagementService.proto3syntax = "proto3";
+
+package dfs.replica;
+
+service ManagementService {
+  rpc heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+message HeartbeatRequest {
+  string sender = 1;
+}
+
+message HeartbeatResponse {
+}
+
+// PaxosService.proto
+syntax = "proto3";
+
+package dfs.replica;
+
+service PaxosService {
+  rpc prepare(PrepareRequest) returns (PrepareResponse);
+  rpc accept(AcceptRequest) returns (AcceptResponse);
+  rpc decide(DecideRequest) returns (DecideResponse);
+}
+
+message PrepareRequest {
+  int64 viewId = 1;
+  int64 n = 2;
+}
+
+message PrepareResponse {
+  bool success = 1;
+  bool isOld = 2;
+  int64 viewId = 3;
+  repeated string view = 4;
+}
+
+message AcceptRequest {
+  int64 n = 1;
+  repeated string view = 2;
+}
+
+message AcceptResponse {
+  bool success = 1;
+}
+
+message DecideRequest {
+  int64 viewId = 1;
+  repeated string view = 2;
+}
+
+message DecideResponse {
+}
+
+// ReplicaService.proto
+syntax = "proto3";
+
+package dfs.replica;
+
+service ReplicaService {
+  rpc stop(StopRequest) returns (StopResponse);
+  rpc getView(GetViewRequest) returns (GetViewResponse);
+  rpc executeMethod(ExecuteMethodRequest) returns (ExecuteMethodResponse);
+  rpc getExecutedMethods(GetExecutedMethodsRequest) returns (GetExecutedMethodsResponse);
+  rpc isRecovered(IsRecoveredRequest) returns (IsRecoveredResponse);
+}
+
+message StopRequest {
+}
+
+message StopResponse {
+}
+
+message GetViewRequest {
+}
+
+message GetViewResponse {
+  int64 viewId = 1;
+  repeated string view = 2;
+}
+
+message ExecuteMethodRequest {
+  MethodRequest methodRequest = 1;
+  Viewstamp viewstamp = 2;
+}
+
+message ExecuteMethodResponse {
+  bool isPrimary = 1;
+  optional string returnValue = 2;  // Value is serialized JSON object
+}
+
+message MethodRequest {
+  string methodName = 1;
+  repeated string methodParameters = 2;  // Each method parameter is serialized JSON object
+}
+
+message Viewstamp {
+  int64 viewId = 1;
+  int64 sequence = 2;
+}
+
+message GetExecutedMethodsRequest {
+}
+
+message GetExecutedMethodsResponse {
+  repeated MethodRequest methodRequests = 1;
+}
+
+message IsRecoveredRequest {
+}
+
+message IsRecoveredResponse {
+  bool isRecovered = 1;
+}
